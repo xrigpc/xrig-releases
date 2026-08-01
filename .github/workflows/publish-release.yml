@@ -1,26 +1,26 @@
-name: Build and publish XRIG app release
+name: Publish signed Kai release
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: GitHub Release tag for this immutable release set (for example v1.0.0)
+        description: Immutable GitHub Release tag (for example v1.0.2-rc.1)
         required: true
         type: string
       platform_tag:
-        description: Exact annotated/lightweight tag in xrigpc/xrig-platform
+        description: Exact XRIG Platform tag used to build the verifier
         required: true
         type: string
       vertex_tag:
-        description: Exact annotated/lightweight tag in xrigpc/xrig-llama-backend
+        description: Existing Vertex compatibility tag; it is not rebuilt in a Kai-only release
         required: true
         type: string
       kai_tag:
-        description: Exact annotated/lightweight tag in xrigpc/kai
+        description: Exact Kai source tag to package
         required: true
         type: string
       prerelease:
-        description: Publish as a factory pre-release; promote it to stable only after pilot acceptance
+        description: Publish a -rc.* candidate (must agree with release_tag and kai_tag)
         required: true
         default: true
         type: boolean
@@ -29,15 +29,15 @@ permissions:
   contents: write
 
 concurrency:
-  group: xrig-release-${{ inputs.release_tag }}
+  group: xrig-kai-release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
   publish:
-    name: Build, sign, and publish tagged Windows release
+    name: Build, sign, and publish Kai
     if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 75
     environment: production
     env:
       XRIG_SOURCE_READ_TOKEN: ${{ secrets.XRIG_SOURCE_READ_TOKEN }}
@@ -53,6 +53,7 @@ jobs:
         run: |
           ./scripts/Test-PublishReleaseWorkflow.ps1
           ./scripts/Test-NewXrigReleaseManifest.ps1
+          ./scripts/Test-NewKaiInstallBootstrap.ps1
 
       - name: Validate inputs and protected configuration
         id: versions
@@ -63,18 +64,17 @@ jobs:
             if (-not [Environment]::GetEnvironmentVariable($name)) { throw "$name is not configured in the production environment." }
           }
           function Convert-TagToVersion([string]$value, [string]$name) {
-            if ($value -notmatch '^v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$') {
-              throw "$name must be a v-prefixed SemVer tag."
-            }
+            if ($value -notmatch '^v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$') { throw "$name must be a v-prefixed SemVer tag." }
             return $Matches[1]
           }
           $release = Convert-TagToVersion '${{ inputs.release_tag }}' 'release_tag'
-          $platform = Convert-TagToVersion '${{ inputs.platform_tag }}' 'platform_tag'
-          $vertex = Convert-TagToVersion '${{ inputs.vertex_tag }}' 'vertex_tag'
+          "platform=$(Convert-TagToVersion '${{ inputs.platform_tag }}' 'platform_tag')" >> $env:GITHUB_OUTPUT
+          "vertex=$(Convert-TagToVersion '${{ inputs.vertex_tag }}' 'vertex_tag')" >> $env:GITHUB_OUTPUT
           $kai = Convert-TagToVersion '${{ inputs.kai_tag }}' 'kai_tag'
+          $isCandidate = $release -match '-rc\.[0-9]+$'
+          if ($release -ne $kai) { throw 'release_tag and kai_tag must identify the same Kai version.' }
+          if ((('${{ inputs.prerelease }}' -eq 'true')) -ne $isCandidate) { throw 'prerelease must be true only for a -rc.N release_tag.' }
           "release=$release" >> $env:GITHUB_OUTPUT
-          "platform=$platform" >> $env:GITHUB_OUTPUT
-          "vertex=$vertex" >> $env:GITHUB_OUTPUT
           "kai=$kai" >> $env:GITHUB_OUTPUT
 
       - name: Check out tagged XRIG Platform source
@@ -86,15 +86,6 @@ jobs:
           persist-credentials: false
           path: src/platform
 
-      - name: Check out tagged Vertex source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: xrigpc/xrig-llama-backend
-          ref: ${{ inputs.vertex_tag }}
-          token: ${{ secrets.XRIG_SOURCE_READ_TOKEN }}
-          persist-credentials: false
-          path: src/vertex
-
       - name: Check out tagged Kai source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -104,18 +95,16 @@ jobs:
           persist-credentials: false
           path: src/kai
 
-      - name: Confirm every source checkout is exactly its requested tag
+      - name: Confirm immutable source tags
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           function Assert-ExactTag([string]$path, [string]$expected, [string]$label) {
             $actual = (git -C $path describe --tags --exact-match).Trim()
             if ($actual -ne $expected) { throw "$label is checked out at $actual, not requested tag $expected." }
-            $sha = (git -C $path rev-parse HEAD).Trim()
-            "$($label.ToUpperInvariant())_SHA=$sha" >> $env:GITHUB_ENV
+            "$($label.ToUpperInvariant())_SHA=$((git -C $path rev-parse HEAD).Trim())" >> $env:GITHUB_ENV
           }
           Assert-ExactTag 'src/platform' '${{ inputs.platform_tag }}' 'platform'
-          Assert-ExactTag 'src/vertex' '${{ inputs.vertex_tag }}' 'vertex'
           Assert-ExactTag 'src/kai' '${{ inputs.kai_tag }}' 'kai'
 
       - name: Set up Go
@@ -124,17 +113,17 @@ jobs:
           go-version-file: src/platform/go.mod
 
       - name: Set up Node.js 22.23.1
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22.23.1
 
-      - name: Set up Python 3.11.9
+      - name: Set up CPython 3.12.10
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: 3.11.9
+          python-version: 3.12.10
           architecture: x64
 
-      - name: Set up locked uv for Kai runtime preparation
+      - name: Set up uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: 0.8.22
@@ -146,15 +135,12 @@ jobs:
           PLATFORM_VERSION: ${{ steps.versions.outputs.platform }}
         run: |
           $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path tools, artifacts | Out-Null
           Push-Location src/platform
           try {
-            ./scripts/xrig-identity.contract.Tests.ps1
-            ./scripts/build-xrig-identity.contract.Tests.ps1
-            ./scripts/Install-XRIG-Platform.contract.Tests.ps1
-            New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\tools", "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
+            go test ./identity ./release ./cmd/xrig-identity
             ./scripts/build-xrig-identity.ps1 -Version $env:PLATFORM_VERSION -SupabaseAnonKey $env:SUPABASE_ANON_KEY -ActivationResponsePublicKeyHex $env:ACTIVATION_RESPONSE_PUBLIC_KEY_HEX -OutputPath "$env:GITHUB_WORKSPACE\tools\xrig-identity.exe"
             go build -trimpath -o "$env:GITHUB_WORKSPACE\tools\xrig-keytool.exe" ./cmd/xrig-keytool
-            Copy-Item "$env:GITHUB_WORKSPACE\tools\xrig-identity.exe" "$env:GITHUB_WORKSPACE\artifacts\xrig-identity-$env:PLATFORM_VERSION-win-x64.exe" -Force
           }
           finally { Pop-Location }
 
@@ -174,194 +160,76 @@ jobs:
             & tools\xrig-identity.exe --mode verify-artifact --file $probe --signature $signature --sha256 $hash --json | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'The CI release key does not match the XRIG Platform embedded release public key.' }
           }
-          finally {
-            Remove-Item -LiteralPath $key, $probe, $signature -Force -ErrorAction SilentlyContinue
-          }
+          finally { Remove-Item -LiteralPath $key, $probe, $signature -Force -ErrorAction SilentlyContinue }
 
-      - name: Build tagged Vertex artifacts
-        shell: pwsh
-        env:
-          VERTEX_VERSION: ${{ steps.versions.outputs.vertex }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path artifacts, artifacts\stage\xrig\bin, artifacts\stage\xrig\LICENSES | Out-Null
-          Push-Location src/vertex
-          try {
-            npm ci --prefix cmd/xrig-app/frontend
-            npm run build --prefix cmd/xrig-app/frontend
-            $wailsVersion = (Get-Content .wails-version -Raw).Trim()
-            go install "github.com/wailsapp/wails/v2/cmd/wails@$wailsVersion"
-            $wailsBin = "$(go env GOPATH)\bin"
-            $env:PATH = "$wailsBin;$env:PATH"
-            Push-Location cmd/xrig-app
-            try { wails build -tags xrigapp -platform windows/amd64 -o xrig-app.exe }
-            finally { Pop-Location }
-            Copy-Item cmd/xrig-app/build/bin/xrig-app.exe "$env:GITHUB_WORKSPACE\artifacts\Vertex-$env:VERTEX_VERSION-win-x64.exe" -Force
-            go build -trimpath -ldflags '-s -w' -o "$env:GITHUB_WORKSPACE\artifacts\Vertex-install-$env:VERTEX_VERSION-win-x64.exe" ./cmd/xrig-install
-            go build -trimpath -ldflags '-s -w' -o "$env:GITHUB_WORKSPACE\artifacts\stage\xrig\bin\xrig-serve.exe" ./cmd/xrig-serve
-            Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\artifacts\stage\xrig\VERSION" -Value $env:VERTEX_VERSION -Encoding ascii -NoNewline
-            Copy-Item THIRD_PARTY_NOTICES.md "$env:GITHUB_WORKSPACE\artifacts\stage\xrig\NOTICE" -Force
-            Copy-Item licenses\Apache-2.0.txt "$env:GITHUB_WORKSPACE\artifacts\stage\xrig\LICENSES\Apache-2.0.txt" -Force
-            tar -czf "$env:GITHUB_WORKSPACE\artifacts\Vertex-runtime-$env:VERTEX_VERSION-win-x64.tar.gz" -C "$env:GITHUB_WORKSPACE\artifacts\stage" xrig
-            Copy-Item configs\gemma4-12b-5060ti.json "$env:GITHUB_WORKSPACE\artifacts\gemma4-12b-5060ti.json" -Force
-            Copy-Item scripts\install.ps1 "$env:GITHUB_WORKSPACE\artifacts\Install-Vertex-inner-$env:VERTEX_VERSION.ps1" -Force
-            Copy-Item scripts\bootstrap.ps1 "$env:GITHUB_WORKSPACE\artifacts\Install-Vertex.ps1" -Force
-          }
-          finally { Pop-Location }
-
-      - name: Mirror the locked Vertex runtime archives
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $archives = @(
-            @{ tag = 'b9878'; name = 'llama-b9878-bin-win-cuda-12.4-x64.zip' },
-            @{ tag = 'b9878'; name = 'cudart-llama-bin-win-cuda-12.4-x64.zip' },
-            @{ tag = 'b9999'; name = 'llama-b9999-bin-win-vulkan-x64.zip' },
-            @{ tag = 'b9999'; name = 'llama-b9999-bin-win-openvino-2026.2.1-x64.zip' }
-          )
-          foreach ($archive in $archives) {
-            Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/ggml-org/llama.cpp/releases/download/$($archive.tag)/$($archive.name)" -OutFile (Join-Path $env:GITHUB_WORKSPACE "artifacts\$($archive.name)")
-          }
-
-      - name: Build tagged Kai artifact
+      - name: Build and inspect tagged Kai package
         shell: pwsh
         env:
           KAI_VERSION: ${{ steps.versions.outputs.kai }}
-          # Kai has no Electron auto-updater. Keep GitHub credentials out of
-          # electron-builder even if a future job-level token is added.
           GH_TOKEN: ''
           GITHUB_TOKEN: ''
         run: |
           $ErrorActionPreference = 'Stop'
           Push-Location src/kai
           try {
-            npm ci
-            npm run build --workspace web
-            npm run build --workspace ui-tui
-            ./scripts/Prepare-Kai-WindowsRuntime.ps1 `
-              -BuildPython (Get-Command python).Source `
-              -UvCommand (Get-Command uv).Source `
-              -BuildNode (Get-Command node).Source `
-              -NpmCommand (Get-Command npm.cmd).Source
-            ./scripts/check-kai-brand.ps1 -RuntimeRoot apps/desktop/build/kai-runtime
-            ./scripts/check-kai-release-policy.ps1
-            npm run assert:runtime:win --workspace apps/desktop
-            # electron-builder treats CI=true as an implicit publish request
-            # unless this is explicit. XRIG publishes the verified assets itself
-            # later in this workflow, so the package build must never publish.
+            npm ci --workspace apps/desktop --workspace apps/shared
+            node scripts/check-kai-product-dependencies.cjs
+            uv sync --locked --project integrations/kai-document-search --python 3.12
+            uv run --project integrations/kai-document-search python -W error::RuntimeWarning -c "from kai_document_search import server; print('Kai document-search imports passed.')"
+            uv run --project integrations/kai-document-search python -W error::RuntimeWarning -m unittest discover -s integrations/kai-document-search/tests -v
+            uv sync --locked --extra dev --python 3.12
+            npm run typecheck --workspace apps/desktop
+            node --test apps/desktop/electron/kai-runtime-stage.test.cjs apps/desktop/electron/kai-product-main.test.cjs apps/desktop/electron/xrig-identity.test.cjs apps/desktop/electron/vertex-runtime.test.cjs apps/desktop/electron/windows-child-process.test.cjs
+            npm run test:ui --workspace apps/desktop -- src/app/settings/providers-settings.test.tsx src/app/messaging/whatsapp-allowlist-editor.test.tsx
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-kai-product-policy.ps1
             npm run dist:win:nsis --workspace apps/desktop -- --publish never
-            $package = @(Get-ChildItem apps/desktop/release/kai-*-win-x64.exe -File)
-            if ($package.Count -ne 1) { throw 'Expected exactly one Kai NSIS package.' }
-            Copy-Item $package[0].FullName "$env:GITHUB_WORKSPACE\artifacts\Kai-$env:KAI_VERSION-win-x64.exe" -Force
-            Copy-Item scripts\Install-Kai.ps1 "$env:GITHUB_WORKSPACE\artifacts\Install-Kai-inner-$env:KAI_VERSION.ps1" -Force
-            Copy-Item scripts\bootstrap-kai.ps1 "$env:GITHUB_WORKSPACE\artifacts\Install-Kai.ps1" -Force
+            $expectedPackageName = "Kai-$env:KAI_VERSION-win-x64.exe"
+            $package = @(Get-ChildItem -LiteralPath "apps/desktop/release/$expectedPackageName" -File)
+            if ($package.Count -ne 1) { throw "Expected Kai NSIS package: $expectedPackageName" }
+            $runtime = 'apps/desktop/release/win-unpacked/resources/kai-runtime/backend'
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-kai-product-policy.ps1 -RuntimeRoot $runtime
+            uv run python scripts/test-kai-runtime-route-policy.py --runtime-root $runtime
+            node apps/desktop/scripts/check-kai-package-policy.cjs apps/desktop/release/win-unpacked/resources/app.asar
+            foreach ($required in @("$runtime/scripts/provision-kai.ps1", 'apps/desktop/release/win-unpacked/resources/kai-windows-x64.lock.json')) {
+              if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Kai package is missing $required." }
+            }
+            if (Test-Path -LiteralPath "$runtime/scripts/install.ps1" -PathType Leaf) { throw 'Kai package contains the obsolete public installer.' }
+            Copy-Item $package[0].FullName "$env:GITHUB_WORKSPACE\artifacts\$expectedPackageName" -Force
           }
           finally { Pop-Location }
 
-      - name: Validate candidate artifact inventory
+      - name: Generate source lock and public Kai bootstrap
         shell: pwsh
         env:
-          PLATFORM_VERSION: ${{ steps.versions.outputs.platform }}
-          VERTEX_VERSION: ${{ steps.versions.outputs.vertex }}
           KAI_VERSION: ${{ steps.versions.outputs.kai }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $required = @(
-            "xrig-identity-$($env:PLATFORM_VERSION)-win-x64.exe",
-            "Vertex-$($env:VERTEX_VERSION)-win-x64.exe",
-            "Vertex-install-$($env:VERTEX_VERSION)-win-x64.exe",
-            "Vertex-runtime-$($env:VERTEX_VERSION)-win-x64.tar.gz",
-            "Kai-$($env:KAI_VERSION)-win-x64.exe",
-            "Install-Vertex-inner-$($env:VERTEX_VERSION).ps1",
-            "Install-Kai-inner-$($env:KAI_VERSION).ps1",
-            'Install-Vertex.ps1',
-            'Install-Kai.ps1',
-            'llama-b9878-bin-win-cuda-12.4-x64.zip',
-            'cudart-llama-bin-win-cuda-12.4-x64.zip',
-            'llama-b9999-bin-win-vulkan-x64.zip',
-            'llama-b9999-bin-win-openvino-2026.2.1-x64.zip',
-            'gemma4-12b-5060ti.json'
-          )
-          foreach ($name in $required) {
-            $path = Join-Path artifacts $name
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release artifact: $name" }
-            if ((Get-Item -LiteralPath $path).Length -le 0) { throw "Empty release artifact: $name" }
-          }
-          foreach ($name in @("xrig-identity-$($env:PLATFORM_VERSION)-win-x64.exe", "Vertex-$($env:VERTEX_VERSION)-win-x64.exe", "Vertex-install-$($env:VERTEX_VERSION)-win-x64.exe")) {
-            $bytes = [IO.File]::ReadAllBytes((Join-Path artifacts $name))
-            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Expected Windows PE artifact: $name" }
-            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
-            if ($peOffset -lt 0 -or $peOffset + 6 -ge $bytes.Length -or [BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) {
-              throw "Expected AMD64 PE artifact: $name"
-            }
-          }
-          # NSIS emits a PE32 installer launcher even when its application payload
-          # is x64. Validate that launcher as a PE, then validate the actual Kai
-          # executable staged inside win-unpacked as AMD64.
-          $kaiInstaller = "Kai-$($env:KAI_VERSION)-win-x64.exe"
-          $kaiInstallerBytes = [IO.File]::ReadAllBytes((Join-Path artifacts $kaiInstaller))
-          if ($kaiInstallerBytes.Length -lt 64 -or $kaiInstallerBytes[0] -ne 0x4D -or $kaiInstallerBytes[1] -ne 0x5A) {
-            throw "Expected Windows NSIS installer: $kaiInstaller"
-          }
-          $kaiPayload = 'src/kai/apps/desktop/release/win-unpacked/kai.exe'
-          if (-not (Test-Path -LiteralPath $kaiPayload -PathType Leaf)) { throw 'Kai unpacked x64 executable is missing.' }
-          $kaiPayloadBytes = [IO.File]::ReadAllBytes($kaiPayload)
-          $kaiPayloadOffset = [BitConverter]::ToInt32($kaiPayloadBytes, 0x3C)
-          if ($kaiPayloadBytes.Length -lt 64 -or $kaiPayloadBytes[0] -ne 0x4D -or $kaiPayloadBytes[1] -ne 0x5A -or
-              $kaiPayloadOffset -lt 0 -or $kaiPayloadOffset + 6 -ge $kaiPayloadBytes.Length -or [BitConverter]::ToUInt16($kaiPayloadBytes, $kaiPayloadOffset + 4) -ne 0x8664) {
-            throw 'Expected AMD64 Kai executable inside the NSIS package.'
-          }
-          $config = Get-Content -LiteralPath artifacts\gemma4-12b-5060ti.json -Raw | ConvertFrom-Json
-          if ($config.model.alias -ne 'gemma-4-12b-it') { throw 'Factory config does not expose gemma-4-12b-it.' }
-
-      - name: Refuse to publish a Supabase release bootstrap
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($file in @('artifacts\Install-Vertex.ps1', 'artifacts\Install-Kai.ps1')) {
-            $content = Get-Content -LiteralPath $file -Raw
-            if ($content -match 'supabase\.co/storage' -or $content -notmatch 'github\.com/Pallav0099/xrig-releases') {
-              throw "$file has not been migrated to the GitHub Releases bootstrap contract."
-            }
-          }
-
-      - name: Record source lock
-        shell: pwsh
-        run: |
           $lock = [ordered]@{
             format = 'xrig-source-lock-v1'
             release_tag = '${{ inputs.release_tag }}'
             platform = [ordered]@{ tag = '${{ inputs.platform_tag }}'; sha = $env:PLATFORM_SHA }
-            vertex = [ordered]@{ tag = '${{ inputs.vertex_tag }}'; sha = $env:VERTEX_SHA }
+            vertex_compatibility_tag = '${{ inputs.vertex_tag }}'
             kai = [ordered]@{ tag = '${{ inputs.kai_tag }}'; sha = $env:KAI_SHA }
           }
           $lock | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath artifacts\source-lock.json -Encoding utf8
+          $channel = if ('${{ inputs.prerelease }}' -eq 'true') { 'candidate' } else { 'stable' }
+          ./scripts/New-KaiInstallBootstrap.ps1 -ReleaseTag '${{ inputs.release_tag }}' -KaiVersion $env:KAI_VERSION -Channel $channel -OutputPath artifacts\Install-Kai.ps1
 
-      - name: Sign immutable release payloads
+      - name: Sign Kai release assets
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $key = Join-Path $env:RUNNER_TEMP 'xrig-release-signing.key'
           try {
             [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:XRIG_RELEASE_SIGNING_PKCS8_B64))
-            $unsigned = Get-ChildItem artifacts -File | Where-Object { $_.Name -ne 'gemma4-12b-5060ti.json' }
-            foreach ($artifact in $unsigned) {
+            foreach ($artifact in @(Get-ChildItem artifacts -File)) {
               & tools\xrig-keytool.exe sign --private-key $key --file $artifact.FullName --signature "$($artifact.FullName).sig"
               if ($LASTEXITCODE -ne 0) { throw "Signing failed: $($artifact.Name)" }
             }
-            $artifactRoot = (Resolve-Path artifacts).Path.TrimEnd('\\')
-            $unsigned | Get-FileHash -Algorithm SHA256 | ForEach-Object {
-              $relativePath = $_.Path.Substring($artifactRoot.Length).TrimStart('\\')
-              "$($_.Hash.ToLowerInvariant())  $relativePath"
-            } | Set-Content -LiteralPath artifacts\SHA256SUMS.txt -Encoding ascii
-            & tools\xrig-keytool.exe sign --private-key $key --file artifacts\SHA256SUMS.txt --signature artifacts\SHA256SUMS.txt.sig
-            if ($LASTEXITCODE -ne 0) { throw 'Signing failed: SHA256SUMS.txt' }
           }
-          finally {
-            Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
-          }
+          finally { Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
 
-      - name: Generate and verify canonical release manifest
+      - name: Generate and verify canonical Kai manifest
         shell: pwsh
         env:
           PLATFORM_VERSION: ${{ steps.versions.outputs.platform }}
@@ -370,58 +238,64 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $channel = if ('${{ inputs.prerelease }}' -eq 'true') { 'candidate' } else { 'stable' }
-          ./scripts/New-XrigReleaseManifest.ps1 `
-            -ReleaseTag '${{ inputs.release_tag }}' `
-            -PlatformVersion $env:PLATFORM_VERSION `
-            -VertexVersion $env:VERTEX_VERSION `
-            -KaiVersion $env:KAI_VERSION `
-            -Channel $channel `
-            -AssetDirectory artifacts `
-            -OutputPath artifacts\xrig-release-v1.manifest
+          ./scripts/New-XrigReleaseManifest.ps1 -ReleaseTag '${{ inputs.release_tag }}' -PlatformVersion $env:PLATFORM_VERSION -VertexVersion $env:VERTEX_VERSION -KaiVersion $env:KAI_VERSION -Channel $channel -AssetDirectory artifacts -OutputPath artifacts\xrig-release-v1.manifest
           $key = Join-Path $env:RUNNER_TEMP 'xrig-release-signing.key'
           try {
             [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:XRIG_RELEASE_SIGNING_PKCS8_B64))
             & tools\xrig-keytool.exe sign --private-key $key --file artifacts\xrig-release-v1.manifest --signature artifacts\xrig-release-v1.manifest.sig
             if ($LASTEXITCODE -ne 0) { throw 'Signing failed: xrig-release-v1.manifest' }
           }
-          finally {
-            Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
-          }
-          & tools\xrig-identity.exe --mode verify-release --manifest artifacts\xrig-release-v1.manifest --signature artifacts\xrig-release-v1.manifest.sig --json
+          finally { Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
+          & tools\xrig-identity.exe --mode verify-release --manifest artifacts\xrig-release-v1.manifest --signature artifacts\xrig-release-v1.manifest.sig --json | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'XRIG Platform rejected the generated release manifest.' }
-          if ((Get-ChildItem artifacts -File | Where-Object { $_.Length -ge 2GB }).Count -ne 0) {
-            throw 'A GitHub Release asset reached the 2 GiB per-file limit.'
+
+      - name: Create signed checksums and validate release inventory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unsigned = Get-ChildItem artifacts -File | Where-Object { $_.Name -notmatch '\.sig$|^SHA256SUMS\.txt$' }
+          $artifactRoot = (Resolve-Path artifacts).Path.TrimEnd('\\')
+          $unsigned | Get-FileHash -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash.ToLowerInvariant())  $($_.Path.Substring($artifactRoot.Length).TrimStart('\\'))"
+          } | Set-Content -LiteralPath artifacts\SHA256SUMS.txt -Encoding ascii
+          $key = Join-Path $env:RUNNER_TEMP 'xrig-release-signing.key'
+          try {
+            [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:XRIG_RELEASE_SIGNING_PKCS8_B64))
+            & tools\xrig-keytool.exe sign --private-key $key --file artifacts\SHA256SUMS.txt --signature artifacts\SHA256SUMS.txt.sig
+            if ($LASTEXITCODE -ne 0) { throw 'Signing failed: SHA256SUMS.txt' }
+          }
+          finally { Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
+          foreach ($file in Get-ChildItem artifacts -File) {
+            if ($file.Length -lt 1) { throw "Empty release file: $($file.Name)" }
+            if ($file.Length -ge 2GB) { throw "GitHub Release asset exceeds the 2 GiB limit: $($file.Name)" }
           }
 
       - name: Publish immutable GitHub Release assets
         shell: pwsh
         env:
-          RELEASE_VERSION: ${{ steps.versions.outputs.release }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.versions.outputs.release }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $releaseTags = @(& gh release list --repo Pallav0099/xrig-releases --limit 1000 --json tagName --jq '.[].tagName')
+          $existing = @(& gh release list --repo xrigpc/xrig-releases --limit 1000 --json tagName --jq '.[].tagName')
           if ($LASTEXITCODE -ne 0) { throw 'Could not query existing GitHub Releases.' }
-          if ($releaseTags -contains '${{ inputs.release_tag }}') {
-            throw "GitHub Release ${{ inputs.release_tag }} already exists. Immutable release assets must not be replaced."
-          }
+          if ($existing -contains '${{ inputs.release_tag }}') { throw "Release ${{ inputs.release_tag }} already exists; immutable assets cannot be replaced." }
           $manifestHash = (Get-FileHash -LiteralPath artifacts\xrig-release-v1.manifest -Algorithm SHA256).Hash.ToLowerInvariant()
           @"
-          # XRIG AI PC $env:RELEASE_VERSION
+          # XRIG Kai $env:RELEASE_VERSION
 
           Source locks:
           - Platform: ${{ inputs.platform_tag }} ($env:PLATFORM_SHA)
-          - Vertex: ${{ inputs.vertex_tag }} ($env:VERTEX_SHA)
+          - Vertex compatibility: ${{ inputs.vertex_tag }}
           - Kai: ${{ inputs.kai_tag }} ($env:KAI_SHA)
 
           Manifest SHA-256: $manifestHash
 
-          Every executable and installer must pass local XRIG Platform identity
-          verification plus detached Ed25519 and SHA-256 validation before use.
+          The unsigned Windows installer is validated locally by XRIG Platform identity verification plus Ed25519 signatures and SHA-256 before installation.
           "@ | Set-Content -LiteralPath artifacts\RELEASE_NOTES.md -Encoding utf8
-          $args = @('release', 'create', '${{ inputs.release_tag }}', '--repo', 'Pallav0099/xrig-releases', '--title', "XRIG AI PC $env:RELEASE_VERSION", '--notes-file', 'artifacts\RELEASE_NOTES.md')
+          $args = @('release', 'create', '${{ inputs.release_tag }}', '--repo', 'xrigpc/xrig-releases', '--title', "XRIG Kai $env:RELEASE_VERSION", '--notes-file', 'artifacts\RELEASE_NOTES.md')
           if ('${{ inputs.prerelease }}' -eq 'true') { $args += '--prerelease' }
-          $args += @(Get-ChildItem artifacts -File | Where-Object { $_.Name -ne 'RELEASE_NOTES.md' } | ForEach-Object FullName)
+          $args += @(Get-ChildItem artifacts -File | Where-Object Name -ne 'RELEASE_NOTES.md' | ForEach-Object FullName)
           & gh @args
           if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed.' }
 
@@ -431,12 +305,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $expected = @(Get-ChildItem artifacts -File | Where-Object { $_.Name -ne 'RELEASE_NOTES.md' } | ForEach-Object {
-            [pscustomobject]@{ name = $_.Name; size = [int64]$_.Length }
-          } | Sort-Object name)
-          $actual = @((gh release view '${{ inputs.release_tag }}' --repo Pallav0099/xrig-releases --json assets --jq '.assets[] | {name: .name, size: .size}' | ConvertFrom-Json) | Sort-Object name)
-          $expectedJson = $expected | ConvertTo-Json -Compress
-          $actualJson = $actual | ConvertTo-Json -Compress
-          if ($expectedJson -ne $actualJson) {
-            throw "Published GitHub Release assets do not match the signed inventory. Expected: $expectedJson Actual: $actualJson"
-          }
+          $expected = @(Get-ChildItem artifacts -File | Where-Object Name -ne 'RELEASE_NOTES.md' | ForEach-Object { [pscustomobject]@{ name = $_.Name; size = [int64]$_.Length } } | Sort-Object name)
+          $actual = @((gh release view '${{ inputs.release_tag }}' --repo xrigpc/xrig-releases --json assets --jq '.assets[] | {name: .name, size: .size}' | ConvertFrom-Json) | Sort-Object name)
+          if (($expected | ConvertTo-Json -Compress) -ne ($actual | ConvertTo-Json -Compress)) { throw 'Published GitHub Release assets do not match the signed release inventory.' }

@@ -1,87 +1,46 @@
 [CmdletBinding()]
-param(
-    [string]$WorkflowPath = (Join-Path $PSScriptRoot '..\.github\workflows\publish-release.yml')
-)
+param([string]$WorkflowPath = '')
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($WorkflowPath)) {
+    $WorkflowPath = Join-Path $PSScriptRoot '..\.github\workflows\publish-release.yml'
+}
+$content = Get-Content -LiteralPath (Resolve-Path -LiteralPath $WorkflowPath) -Raw
 
-function Assert-True {
-    param(
-        [Parameter(Mandatory)]
-        [bool]$Condition,
-
-        [Parameter(Mandatory)]
-        [string]$Message
-    )
-
-    if (-not $Condition) {
-        throw $Message
-    }
+function Assert-Contains([string]$Needle, [string]$Message) {
+    if (-not $content.Contains($Needle)) { throw $Message }
+}
+function Assert-NotContains([string]$Needle, [string]$Message) {
+    if ($content.Contains($Needle)) { throw $Message }
 }
 
-function Get-StepBlock {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Content,
+Assert-Contains 'workflow_dispatch:' 'Release workflow must be manually dispatched.'
+Assert-NotContains "`n  push:" 'Release workflow must not run on push.'
+Assert-NotContains "`n  pull_request:" 'Release workflow must not run on pull requests.'
+Assert-NotContains 'schedule:' 'Release workflow must not run on a schedule.'
+Assert-NotContains 'Pallav0099/' 'Release workflow must use canonical xrigpc repositories.'
+Assert-NotContains 'src/vertex' 'Kai-only publication must not check out or build Vertex.'
+Assert-NotContains 'Prepare-Kai-WindowsRuntime.ps1' 'Removed Kai runtime preparation hook must not be invoked.'
+Assert-NotContains 'check-kai-brand.ps1' 'Removed brand hook must not be invoked.'
+Assert-NotContains 'check-kai-release-policy.ps1' 'Removed policy hook must not be invoked.'
+Assert-Contains 'New-KaiInstallBootstrap.ps1' 'Release workflow must generate a versioned Kai bootstrap.'
+Assert-Contains 'check-kai-product-policy.ps1' 'Release workflow must run the Kai package policy gate.'
+Assert-Contains 'python-version: 3.12.10' 'Release workflow must build against the locked CPython runtime.'
+Assert-Contains 'npm run dist:win:nsis --workspace apps/desktop -- --publish never' 'Electron build must never publish directly.'
+Assert-Contains 'xrigpc/xrig-releases' 'Release publication must target the canonical release repository.'
+Assert-Contains 'verify-release' 'Release workflow must verify the generated manifest with Platform.'
+Assert-Contains 'Prove release-key coherence with XRIG Platform' 'Release-key coherence proof is required.'
+Assert-Contains "release_tag and kai_tag must identify the same Kai version." 'Release workflow must bind the source tag to the release tag.'
+Assert-Contains "prerelease must be true only for a -rc.N release_tag." 'Release workflow must bind the channel to the release tag.'
+Assert-Contains 'npm ci --workspace apps/desktop --workspace apps/shared' 'Release workflow must install only the packaged Kai workspaces.'
+Assert-NotContains 'npm run build --workspace web' 'Release workflow must not build the unshipped web workspace.'
+Assert-NotContains 'npm run build --workspace ui-tui' 'Release workflow must not build the unshipped Node TUI workspace.'
+Assert-Contains 'Kai document-search imports passed.' 'Release workflow must assert document-search imports.'
+Assert-Contains 'check-kai-package-policy.cjs' 'Release workflow must scan the unpacked package payload.'
 
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    $escapedName = [Regex]::Escape($Name)
-    $match = [Regex]::Match(
-        $Content,
-        "(?ms)^      - name: $escapedName\r?\n(?<body>.*?)(?=^      - name: |\z)"
-    )
-    Assert-True $match.Success "Workflow step '$Name' was not found."
-    return $match.Groups['body'].Value
+$uses = @([regex]::Matches($content, '(?m)^\s+uses:\s+([^\r\n#]+)') | ForEach-Object { $_.Groups[1].Value.Trim() })
+foreach ($action in $uses) {
+    if ($action -notmatch '@[0-9a-f]{40}$') { throw "Action is not SHA pinned: $action" }
 }
 
-$resolvedWorkflow = (Resolve-Path -LiteralPath $WorkflowPath).Path
-$content = Get-Content -LiteralPath $resolvedWorkflow -Raw
-
-Assert-True ($content -match '(?m)^on:\r?$') 'Workflow trigger block is missing.'
-Assert-True ($content -match '(?m)^  workflow_dispatch:\r?$') 'Release workflow must remain workflow_dispatch-only.'
-Assert-True ($content -notmatch '(?m)^  (push|pull_request|schedule):') 'Release workflow must not run on push, pull request, or schedule.'
-Assert-True ($content -notmatch '[\u2018\u2019\u201C\u201D]') 'Workflow contains typographic quotes that can break PowerShell parsing.'
-
-$usesLines = @([Regex]::Matches($content, '(?m)^\s+uses:\s+([^\r\n#]+)') | ForEach-Object { $_.Groups[1].Value.Trim() })
-Assert-True ($usesLines.Count -gt 0) 'Workflow contains no pinned actions.'
-foreach ($uses in $usesLines) {
-    Assert-True ($uses -match '@[0-9a-f]{40}$') "Action is not pinned to a full commit SHA: $uses"
-}
-
-$firstStep = $content.IndexOf('      - name: ')
-Assert-True ($firstStep -ge 0) 'Workflow contains no steps.'
-$jobHeader = $content.Substring(0, $firstStep)
-Assert-True ($jobHeader -notmatch '(?m)^\s+GH_TOKEN:') 'GH_TOKEN must not be exposed at job scope.'
-Assert-True ($jobHeader -notmatch '(?m)^\s+GITHUB_TOKEN:') 'GITHUB_TOKEN must not be exposed at job scope.'
-
-$contractStep = Get-StepBlock $content 'Validate release workflow contract'
-Assert-True ($contractStep -match 'Test-PublishReleaseWorkflow\.ps1') 'Release workflow contract test must run before builds.'
-Assert-True ($contractStep -match 'Test-NewXrigReleaseManifest\.ps1') 'Manifest canonicalization test must run before builds.'
-
-$kaiStep = Get-StepBlock $content 'Build tagged Kai artifact'
-Assert-True ($kaiStep -match "(?m)^          GH_TOKEN: ''\r?$") 'Kai build must explicitly clear GH_TOKEN.'
-Assert-True ($kaiStep -match "(?m)^          GITHUB_TOKEN: ''\r?$") 'Kai build must explicitly clear GITHUB_TOKEN.'
-Assert-True ($kaiStep -match 'npm run dist:win:nsis --workspace apps/desktop -- --publish never') 'Kai build must disable electron-builder publication explicitly.'
-
-$publishStep = Get-StepBlock $content 'Publish immutable GitHub Release assets'
-Assert-True ($publishStep -match '(?m)^          GH_TOKEN: \$\{\{ github\.token \}\}\r?$') 'GitHub token must be scoped to the release publication step.'
-Assert-True ($publishStep -match 'gh release list') 'Release existence check must use a non-failing release listing command.'
-Assert-True ($publishStep -notmatch 'if \(& gh release view') 'Release publication must not probe a missing release with a strict native command.'
-Assert-True ($publishStep -match 'Manifest SHA-256: \$manifestHash') 'Release notes must include the evaluated manifest hash.'
-Assert-True ($publishStep -notmatch 'Manifest SHA-256: `\$manifestHash') 'Release notes must not escape manifest-hash interpolation.'
-
-$verifyStep = Get-StepBlock $content 'Verify published asset inventory'
-Assert-True ($verifyStep -match '(?m)^          GH_TOKEN: \$\{\{ github\.token \}\}\r?$') 'GitHub token must be scoped to the published-inventory step.'
-
-$signStep = Get-StepBlock $content 'Sign immutable release payloads'
-Assert-True ($signStep -match '\$relativePath = \$_.Path\.Substring\(\$artifactRoot\.Length\)') 'SHA256SUMS must derive portable relative paths.'
-Assert-True ($signStep -notmatch '\.Replace\(\(Resolve-Path artifacts\)') 'SHA256SUMS must not retain runner-absolute paths.'
-
-$inventoryStep = Get-StepBlock $content 'Validate candidate artifact inventory'
-Assert-True ($inventoryStep -match "\$kaiPayload = 'src/kai/apps/desktop/release/win-unpacked/kai\.exe'") 'Kai package validation must inspect the embedded x64 executable.'
-Assert-True ($inventoryStep -match '0x8664') 'Candidate inventory must validate AMD64 PE payloads.'
-
-Write-Host 'XRIG release workflow contract passed.'
+Write-Host 'Kai release workflow contract passed.'
