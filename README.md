@@ -5,8 +5,8 @@ releases. It intentionally contains **no Kai, Vertex, or XRIG Platform source
 code** and no release binary is committed to Git history.
 
 Every production binary, inner installer, bootstrap, manifest, and signature is
-uploaded as a GitHub Release asset by the protected `Publish signed Kai release`
-workflow. The signed `xrig-release-v1.manifest` is the release
+uploaded as a GitHub Release asset by a protected product-specific workflow.
+The signed `xrig-release-v1.manifest` is the release
 authority; GitHub's `latest` route is only a download selector.
 
 ## What is published
@@ -27,19 +27,18 @@ active-device check.
 
 ## Release workflow
 
-Run `.github/workflows/publish-release.yml` manually from this repository. It
-requires exact **tags**, not branches, for the XRIG Platform verifier and Kai
-source repositories:
+Run the appropriate workflow manually from this repository. Each requires exact
+**tags**, not branches, for the XRIG Platform verifier and its product source:
 
 - `xrigpc/xrig-platform`
-- `xrigpc/kai`
+- `xrigpc/kai` for `publish-release.yml`
+- `xrigpc/xrig-llama-backend` for `publish-vertex-release.yml`
 
-The workflow checks out those tags with a read-only source token, compiles the
-Kai Windows artifact, validates the signed manifest with the Platform verifier,
-and creates either a GitHub pre-release or stable release. Vertex stays on its
-independent release cadence; the compatibility tag in the Kai record is
-metadata, not a rebuilt asset. A versioned asset is never replaced with
-different bytes.
+The Kai workflow compiles Kai only; the Vertex workflow compiles Vertex and its
+locked runtime archives only. Both validate the signed manifest with the
+Platform verifier and create either a GitHub pre-release or stable release. The
+cross-product version field is compatibility metadata, not a rebuilt payload. A
+versioned asset is never replaced with different bytes.
 
 ## Required protected-environment configuration
 
@@ -79,6 +78,7 @@ Once a pre-release is promoted to stable, the public installation endpoints are:
 
 ```powershell
 irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Kai.ps1 | iex
+irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Vertex.ps1 | iex
 ```
 
 The initial bootstrap is HTTPS-trusted by design. Before elevation or product
