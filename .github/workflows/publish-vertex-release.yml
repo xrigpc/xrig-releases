@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Immutable GitHub Release tag (for example v1.0.2-rc.1)
+        description: Immutable GitHub Release tag (for example v1.1.0-rc.1)
         required: true
         type: string
       platform_tag:
@@ -32,18 +32,23 @@ concurrency:
   group: xrig-vertex-release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
+# Vertex's app-only release contract (xrig-llama-backend
+# scripts/sign-release-manifest.sh): the Windows binaries, the Ubuntu .deb and
+# the Windows inner installer are signed and listed in xrig-release-v1.manifest;
+# Install-Vertex.ps1 and install-vertex-linux.sh are the unsigned public
+# bootstraps. Runtime stacks and models are signed and published independently.
 jobs:
-  publish:
-    name: Build, sign, and publish Vertex
+  validate:
+    name: Validate release contract and inputs
     if: github.ref == 'refs/heads/main'
-    runs-on: windows-latest
-    timeout-minutes: 90
-    environment: production
-    env:
-      XRIG_SOURCE_READ_TOKEN: ${{ secrets.XRIG_SOURCE_READ_TOKEN }}
-      XRIG_RELEASE_SIGNING_PKCS8_B64: ${{ secrets.XRIG_RELEASE_SIGNING_PKCS8_B64 }}
-      SUPABASE_ANON_KEY: ${{ vars.XRIG_SUPABASE_ANON_KEY }}
-      ACTIVATION_RESPONSE_PUBLIC_KEY_HEX: ${{ vars.XRIG_ACTIVATION_RESPONSE_PUBLIC_KEY_HEX }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      release: ${{ steps.versions.outputs.release }}
+      platform: ${{ steps.versions.outputs.platform }}
+      vertex: ${{ steps.versions.outputs.vertex }}
+      kai: ${{ steps.versions.outputs.kai }}
+      channel: ${{ steps.versions.outputs.channel }}
     steps:
       - name: Check out release orchestration
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -54,14 +59,11 @@ jobs:
           ./scripts/Test-PublishVertexReleaseWorkflow.ps1
           ./scripts/Test-NewVertexReleaseManifest.ps1
 
-      - name: Validate inputs and protected configuration
+      - name: Validate inputs
         id: versions
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($name in @('XRIG_SOURCE_READ_TOKEN', 'XRIG_RELEASE_SIGNING_PKCS8_B64', 'SUPABASE_ANON_KEY', 'ACTIVATION_RESPONSE_PUBLIC_KEY_HEX')) {
-            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "$name is not configured in the production environment." }
-          }
           function Convert-TagToVersion([string]$value, [string]$name) {
             if ($value -notmatch '^v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$') { throw "$name must be a v-prefixed SemVer tag." }
             return $Matches[1]
@@ -73,10 +75,115 @@ jobs:
           $isCandidate = $release -match '-rc\.[0-9]+$'
           if ($release -ne $vertex) { throw 'release_tag and vertex_tag must identify the same Vertex version.' }
           if ((('${{ inputs.prerelease }}' -eq 'true')) -ne $isCandidate) { throw 'prerelease must be true only for a -rc.N release_tag.' }
+          # The manifest signs its channel, and the bootstraps accept only
+          # "candidate" for a pinned -ReleaseTag and "stable" for latest.
+          $channel = if ($isCandidate) { 'candidate' } else { 'stable' }
           "release=$release" >> $env:GITHUB_OUTPUT
           "platform=$platform" >> $env:GITHUB_OUTPUT
           "vertex=$vertex" >> $env:GITHUB_OUTPUT
           "kai=$kai" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+
+  build-linux:
+    name: Build Ubuntu application package
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    outputs:
+      vertex_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Check out tagged Vertex source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: xrigpc/xrig-llama-backend
+          ref: ${{ inputs.vertex_tag }}
+          token: ${{ secrets.XRIG_SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          path: src/vertex
+
+      - name: Confirm immutable source tag
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C src/vertex describe --tags --exact-match)"
+          [[ "$actual" == '${{ inputs.vertex_tag }}' ]] || { echo "vertex is checked out at $actual, not ${{ inputs.vertex_tag }}" >&2; exit 1; }
+          echo "sha=$(git -C src/vertex rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pinned Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: src/vertex/.go-version
+          cache-dependency-path: src/vertex/go.sum
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version-file: src/vertex/.node-version
+          cache: npm
+          cache-dependency-path: src/vertex/cmd/xrig-app/frontend/package-lock.json
+
+      - name: Ubuntu baseline native GUI dependencies
+        run: |
+          sudo apt-get -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Test and build the Ubuntu package
+        working-directory: src/vertex
+        shell: bash
+        env:
+          VERTEX_VERSION: ${{ needs.validate.outputs.vertex }}
+        run: |
+          set -euo pipefail
+          go test ./...
+          npm ci --prefix cmd/xrig-app/frontend
+          npm test --prefix cmd/xrig-app/frontend -- --run
+          bash scripts/build-linux-gui.sh
+          go test -tags xrigapp,webkit2_41 ./cmd/xrig-app -count=1
+          bash scripts/build-linux-deb.sh "$VERTEX_VERSION"
+          deb="dist/xrig-vertex_${VERTEX_VERSION}_amd64.deb"
+          [[ "$(dpkg-deb --field "$deb" Package)" == xrig-vertex ]] || { echo 'unexpected package name' >&2; exit 1; }
+          [[ "$(dpkg-deb --field "$deb" Version)" == "${VERTEX_VERSION/-/\~}" ]] || { echo 'package version does not match the release' >&2; exit 1; }
+          [[ "$(dpkg-deb --field "$deb" Architecture)" == amd64 ]] || { echo 'package is not amd64' >&2; exit 1; }
+          dpkg-deb --contents "$deb"
+          mkdir -p "$GITHUB_WORKSPACE/linux-package"
+          cp "$deb" "$GITHUB_WORKSPACE/linux-package/"
+
+      - name: Hand the unsigned package to the signing job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vertex-linux-package-${{ inputs.release_tag }}
+          if-no-files-found: error
+          retention-days: 3
+          path: linux-package/*.deb
+
+  publish:
+    name: Build Windows, sign, and publish Vertex
+    needs: [validate, build-linux]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    environment: production
+    env:
+      XRIG_SOURCE_READ_TOKEN: ${{ secrets.XRIG_SOURCE_READ_TOKEN }}
+      XRIG_RELEASE_SIGNING_PKCS8_B64: ${{ secrets.XRIG_RELEASE_SIGNING_PKCS8_B64 }}
+      SUPABASE_ANON_KEY: ${{ vars.XRIG_SUPABASE_ANON_KEY }}
+      ACTIVATION_RESPONSE_PUBLIC_KEY_HEX: ${{ vars.XRIG_ACTIVATION_RESPONSE_PUBLIC_KEY_HEX }}
+      PLATFORM_VERSION: ${{ needs.validate.outputs.platform }}
+      VERTEX_VERSION: ${{ needs.validate.outputs.vertex }}
+      KAI_VERSION: ${{ needs.validate.outputs.kai }}
+      RELEASE_CHANNEL: ${{ needs.validate.outputs.channel }}
+    steps:
+      - name: Check out release orchestration
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate protected configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('XRIG_SOURCE_READ_TOKEN', 'XRIG_RELEASE_SIGNING_PKCS8_B64', 'SUPABASE_ANON_KEY', 'ACTIVATION_RESPONSE_PUBLIC_KEY_HEX')) {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "$name is not configured in the production environment." }
+          }
 
       - name: Check out tagged XRIG Platform source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -103,29 +210,34 @@ jobs:
           function Assert-ExactTag([string]$path, [string]$expected, [string]$label) {
             $actual = (git -C $path describe --tags --exact-match).Trim()
             if ($actual -ne $expected) { throw "$label is checked out at $actual, not requested tag $expected." }
-            "$($label.ToUpperInvariant())_SHA=$((git -C $path rev-parse HEAD).Trim())" >> $env:GITHUB_ENV
+            $sha = (git -C $path rev-parse HEAD).Trim()
+            "$($label.ToUpperInvariant())_SHA=$sha" >> $env:GITHUB_ENV
+            return $sha
           }
-          Assert-ExactTag 'src/platform' '${{ inputs.platform_tag }}' 'platform'
-          Assert-ExactTag 'src/vertex' '${{ inputs.vertex_tag }}' 'vertex'
+          Assert-ExactTag 'src/platform' '${{ inputs.platform_tag }}' 'platform' | Out-Null
+          $vertexSha = Assert-ExactTag 'src/vertex' '${{ inputs.vertex_tag }}' 'vertex'
+          if ($vertexSha -ne '${{ needs.build-linux.outputs.vertex_sha }}') { throw 'The Ubuntu package was built from a different Vertex commit.' }
 
-      - name: Set up Go
+      - name: Set up pinned Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: src/platform/go.mod
+          go-version-file: src/vertex/.go-version
+          cache-dependency-path: |
+            src/vertex/go.sum
+            src/platform/go.sum
 
-      - name: Set up Node.js 22.23.1
+      - name: Set up pinned Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 22.23.1
+          node-version-file: src/vertex/.node-version
           cache: npm
           cache-dependency-path: src/vertex/cmd/xrig-app/frontend/package-lock.json
 
       - name: Build XRIG Platform release tooling
         shell: pwsh
-        env:
-          PLATFORM_VERSION: ${{ steps.versions.outputs.platform }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force -Path tools, artifacts | Out-Null
           Push-Location src/platform
           try {
@@ -153,90 +265,69 @@ jobs:
           }
           finally { Remove-Item -LiteralPath $key, $probe, $signature -Force -ErrorAction SilentlyContinue }
 
-      - name: Build and inspect tagged Vertex artifacts
+      - name: Test and build tagged Vertex Windows artifacts
         shell: pwsh
-        env:
-          VERTEX_VERSION: ${{ steps.versions.outputs.vertex }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           Push-Location src/vertex
           try {
             $unformatted = gofmt -l .
             if ($unformatted) { throw "gofmt required on: $($unformatted -join ', ')" }
             go test ./...
-            go test -tags xrigapp ./cmd/xrig-app -count=1
             go vet ./...
             npm ci --prefix cmd/xrig-app/frontend
-            npm run build --prefix cmd/xrig-app/frontend
-            $wailsVersion = (Get-Content .wails-version -Raw).Trim()
-            go install "github.com/wailsapp/wails/v2/cmd/wails@$wailsVersion"
-            $wailsBin = "$(go env GOPATH)\bin"
-            $env:PATH = "$wailsBin;$env:PATH"
-            Push-Location cmd/xrig-app
-            try { wails build -tags xrigapp -platform windows/amd64 -o xrig-app.exe }
-            finally { Pop-Location }
-            Copy-Item cmd/xrig-app/build/bin/xrig-app.exe "$env:GITHUB_WORKSPACE\artifacts\Vertex-$env:VERTEX_VERSION-win-x64.exe" -Force
-            go build -trimpath -ldflags '-s -w' -o "$env:GITHUB_WORKSPACE\artifacts\Vertex-install-$env:VERTEX_VERSION-win-x64.exe" ./cmd/xrig-install
-            $stage = "$env:GITHUB_WORKSPACE\artifacts\stage\xrig"
-            New-Item -ItemType Directory -Force -Path "$stage\LICENSES" | Out-Null
-            Copy-Item THIRD_PARTY_NOTICES.md "$stage\NOTICE" -Force
-            Copy-Item licenses\Apache-2.0.txt "$stage\LICENSES\Apache-2.0.txt" -Force
-            tar -czf "$env:GITHUB_WORKSPACE\artifacts\Vertex-runtime-$env:VERTEX_VERSION-win-x64.tar.gz" -C "$env:GITHUB_WORKSPACE\artifacts\stage" xrig
-            Copy-Item configs\gemma4-12b-5060ti.json "$env:GITHUB_WORKSPACE\artifacts\gemma4-12b-5060ti.json" -Force
-            Copy-Item scripts\install.ps1 "$env:GITHUB_WORKSPACE\artifacts\Install-Vertex-inner-$env:VERTEX_VERSION.ps1" -Force
-            Copy-Item scripts\bootstrap.ps1 "$env:GITHUB_WORKSPACE\artifacts\Install-Vertex.ps1" -Force
+            npm test --prefix cmd/xrig-app/frontend -- --run
+            ./scripts/build-windows-gui.ps1 $env:VERTEX_VERSION
+            # The GUI embeds frontend/dist, which the build above produced.
+            go test -tags xrigapp ./cmd/xrig-app -count=1
+            foreach ($name in @('xrig-app-windows-amd64.exe', 'xrig-runtime-windows-amd64.exe', 'xrig-stack-helper-windows-amd64.exe', 'vertex-configure-windows-amd64.exe')) {
+              Copy-Item -LiteralPath "dist\$env:VERTEX_VERSION\$name" -Destination "$env:GITHUB_WORKSPACE\artifacts\$name" -Force
+            }
+            Copy-Item -LiteralPath scripts\install.ps1 -Destination "$env:GITHUB_WORKSPACE\artifacts\Install-Vertex-$env:VERTEX_VERSION.ps1" -Force
+            Copy-Item -LiteralPath scripts\bootstrap.ps1 -Destination "$env:GITHUB_WORKSPACE\artifacts\Install-Vertex.ps1" -Force
+            Copy-Item -LiteralPath scripts\bootstrap-linux.sh -Destination "$env:GITHUB_WORKSPACE\artifacts\install-vertex-linux.sh" -Force
           }
           finally { Pop-Location }
 
-      - name: Mirror locked Vertex backend archives
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $archives = @(
-            @{ tag = 'b9878'; name = 'llama-b9878-bin-win-cuda-12.4-x64.zip' },
-            @{ tag = 'b9878'; name = 'cudart-llama-bin-win-cuda-12.4-x64.zip' },
-            @{ tag = 'b9999'; name = 'llama-b9999-bin-win-vulkan-x64.zip' },
-            @{ tag = 'b9999'; name = 'llama-b9999-bin-win-openvino-2026.2.1-x64.zip' }
-          )
-          foreach ($archive in $archives) {
-            $url = "https://github.com/ggml-org/llama.cpp/releases/download/$($archive.tag)/$($archive.name)"
-            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile (Join-Path $env:GITHUB_WORKSPACE "artifacts\$($archive.name)")
-          }
+      - name: Receive the Ubuntu package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: vertex-linux-package-${{ inputs.release_tag }}
+          path: artifacts
 
       - name: Validate Vertex artifact inventory
         shell: pwsh
-        env:
-          VERTEX_VERSION: ${{ steps.versions.outputs.vertex }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $v = $env:VERTEX_VERSION
           $required = @(
-            "Vertex-$env:VERTEX_VERSION-win-x64.exe",
-            "Vertex-install-$env:VERTEX_VERSION-win-x64.exe",
-            "Vertex-runtime-$env:VERTEX_VERSION-win-x64.tar.gz",
-            "Install-Vertex-inner-$env:VERTEX_VERSION.ps1",
             'Install-Vertex.ps1',
-            'gemma4-12b-5060ti.json',
-            'llama-b9878-bin-win-cuda-12.4-x64.zip',
-            'cudart-llama-bin-win-cuda-12.4-x64.zip',
-            'llama-b9999-bin-win-vulkan-x64.zip',
-            'llama-b9999-bin-win-openvino-2026.2.1-x64.zip'
+            'install-vertex-linux.sh',
+            "Install-Vertex-$v.ps1",
+            'xrig-app-windows-amd64.exe',
+            'xrig-runtime-windows-amd64.exe',
+            'xrig-stack-helper-windows-amd64.exe',
+            'vertex-configure-windows-amd64.exe',
+            "xrig-vertex_$($v)_amd64.deb"
           )
+          $present = @(Get-ChildItem artifacts -File | ForEach-Object Name | Sort-Object)
+          if (($present -join "`n") -ne (($required | Sort-Object) -join "`n")) { throw "Unexpected Vertex release inventory: $($present -join ', ')" }
           foreach ($name in $required) {
-            $path = Join-Path artifacts $name
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing Vertex release artifact: $name" }
-            if ((Get-Item -LiteralPath $path).Length -le 0) { throw "Empty Vertex release artifact: $name" }
+            if ((Get-Item -LiteralPath (Join-Path artifacts $name)).Length -le 0) { throw "Empty Vertex release artifact: $name" }
           }
-          foreach ($name in @("Vertex-$env:VERTEX_VERSION-win-x64.exe", "Vertex-install-$env:VERTEX_VERSION-win-x64.exe")) {
+          foreach ($name in @('xrig-app-windows-amd64.exe', 'xrig-runtime-windows-amd64.exe', 'xrig-stack-helper-windows-amd64.exe', 'vertex-configure-windows-amd64.exe')) {
             $bytes = [IO.File]::ReadAllBytes((Join-Path artifacts $name))
             if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Expected Windows PE artifact: $name" }
             $offset = [BitConverter]::ToInt32($bytes, 0x3C)
             if ($offset -lt 0 -or $offset + 6 -ge $bytes.Length -or [BitConverter]::ToUInt16($bytes, $offset + 4) -ne 0x8664) { throw "Expected AMD64 PE artifact: $name" }
           }
-          $config = Get-Content -LiteralPath artifacts\gemma4-12b-5060ti.json -Raw | ConvertFrom-Json
-          if ($config.model.alias -ne 'gemma-4-12b-it') { throw 'Factory config does not expose gemma-4-12b-it.' }
-          foreach ($file in @('artifacts\Install-Vertex.ps1', "artifacts\Install-Vertex-inner-$env:VERTEX_VERSION.ps1")) {
-            $content = Get-Content -LiteralPath $file -Raw
-            if ($content -match 'Pallav0099|supabase\.co/storage' -or $content -notmatch 'github\.com/xrigpc/xrig-releases') { throw "$file is not bound to the canonical XRIG GitHub Releases channel." }
+          $deb = [IO.File]::ReadAllBytes((Join-Path artifacts "xrig-vertex_$($v)_amd64.deb"))
+          if ([Text.Encoding]::ASCII.GetString($deb, 0, 21) -ne "!<arch>`ndebian-binary") { throw 'Expected a Debian package for the Ubuntu asset.' }
+          foreach ($file in @('Install-Vertex.ps1', 'install-vertex-linux.sh', "Install-Vertex-$v.ps1")) {
+            $content = [IO.File]::ReadAllText((Join-Path artifacts $file))
+            if ($content -match 'Pallav0099|supabase\.co/storage' -or -not $content.Contains('xrigpc/xrig-releases/releases/')) { throw "$file is not bound to the canonical XRIG GitHub Releases channel." }
+            if ($content.Contains("`r")) { throw "$file must use LF line endings." }
           }
 
       - name: Sign Vertex release assets
@@ -246,7 +337,9 @@ jobs:
           $key = Join-Path $env:RUNNER_TEMP 'xrig-release-signing.key'
           try {
             [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:XRIG_RELEASE_SIGNING_PKCS8_B64))
-            foreach ($artifact in @(Get-ChildItem artifacts -File | Where-Object { $_.Name -ne 'gemma4-12b-5060ti.json' })) {
+            # The public bootstraps stay unsigned: they change nothing until
+            # Platform has verified the signed manifest and the inner artifact.
+            foreach ($artifact in @(Get-ChildItem artifacts -File | Where-Object { $_.Name -notin @('Install-Vertex.ps1', 'install-vertex-linux.sh') })) {
               & tools\xrig-keytool.exe sign --private-key $key --file $artifact.FullName --signature "$($artifact.FullName).sig"
               if ($LASTEXITCODE -ne 0) { throw "Signing failed: $($artifact.Name)" }
             }
@@ -255,14 +348,9 @@ jobs:
 
       - name: Generate and verify canonical Vertex manifest
         shell: pwsh
-        env:
-          PLATFORM_VERSION: ${{ steps.versions.outputs.platform }}
-          VERTEX_VERSION: ${{ steps.versions.outputs.vertex }}
-          KAI_VERSION: ${{ steps.versions.outputs.kai }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $channel = if ('${{ inputs.prerelease }}' -eq 'true') { 'candidate' } else { 'stable' }
-          ./scripts/New-VertexReleaseManifest.ps1 -ReleaseTag '${{ inputs.release_tag }}' -PlatformVersion $env:PLATFORM_VERSION -VertexVersion $env:VERTEX_VERSION -KaiCompatibilityVersion $env:KAI_VERSION -Channel $channel -AssetDirectory artifacts -OutputPath artifacts\xrig-release-v1.manifest
+          ./scripts/New-VertexReleaseManifest.ps1 -ReleaseTag '${{ inputs.release_tag }}' -PlatformVersion $env:PLATFORM_VERSION -VertexVersion $env:VERTEX_VERSION -KaiCompatibilityVersion $env:KAI_VERSION -Channel $env:RELEASE_CHANNEL -AssetDirectory artifacts -OutputPath artifacts\xrig-release-v1.manifest
           $key = Join-Path $env:RUNNER_TEMP 'xrig-release-signing.key'
           try {
             [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:XRIG_RELEASE_SIGNING_PKCS8_B64))
@@ -270,36 +358,47 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Signing failed: xrig-release-v1.manifest' }
           }
           finally { Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
-          & tools\xrig-identity.exe --mode verify-release --manifest artifacts\xrig-release-v1.manifest --signature artifacts\xrig-release-v1.manifest.sig --json | Out-Null
+          $verified = & tools\xrig-identity.exe --mode verify-release --manifest artifacts\xrig-release-v1.manifest --signature artifacts\xrig-release-v1.manifest.sig --json
           if ($LASTEXITCODE -ne 0) { throw 'XRIG Platform rejected the generated Vertex release manifest.' }
-          if ((Get-ChildItem artifacts -File | Where-Object { $_.Length -ge 2GB }).Count -ne 0) { throw 'A GitHub Release asset reached the 2 GiB per-file limit.' }
-
-      - name: Create signed checksums
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $files = @(Get-ChildItem artifacts -File | Where-Object { $_.Name -notmatch '\.sig$|^SHA256SUMS\.txt$' })
-          $root = (Resolve-Path artifacts).Path.TrimEnd('\\')
-          $files | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $($_.Path.Substring($root.Length).TrimStart('\\'))" } | Set-Content -LiteralPath artifacts\SHA256SUMS.txt -Encoding ascii
-          $key = Join-Path $env:RUNNER_TEMP 'xrig-release-signing.key'
-          try {
-            [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:XRIG_RELEASE_SIGNING_PKCS8_B64))
-            & tools\xrig-keytool.exe sign --private-key $key --file artifacts\SHA256SUMS.txt --signature artifacts\SHA256SUMS.txt.sig
-            if ($LASTEXITCODE -ne 0) { throw 'Signing failed: SHA256SUMS.txt' }
+          $manifest = $verified | ConvertFrom-Json
+          if ($manifest.channel -ne $env:RELEASE_CHANNEL -or $manifest.vertex_version -ne $env:VERTEX_VERSION) { throw 'XRIG Platform verified an unexpected channel or version.' }
+          # Prove every signed payload exactly as the installers will.
+          $lines = [IO.File]::ReadAllLines((Resolve-Path artifacts\xrig-release-v1.manifest))
+          foreach ($pathLine in @($lines | Where-Object { $_ -match '^asset\.([^=]+)\.path=(.+)$' })) {
+            $null = $pathLine -match '^asset\.([^=]+)\.path=(.+)$'
+            $id = $Matches[1]; $name = $Matches[2]
+            $hash = (($lines | Where-Object { $_.StartsWith("asset.$id.sha256=") }) -split '=', 2)[1]
+            & tools\xrig-identity.exe --mode verify-artifact --file "artifacts\$name" --signature "artifacts\$name.sig" --sha256 $hash --json | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "XRIG Platform rejected signed asset $id ($name)." }
           }
-          finally { Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
+          if ((Get-ChildItem artifacts -File | Where-Object { $_.Length -ge 2GB }).Count -ne 0) { throw 'A GitHub Release asset reached the 2 GiB per-file limit.' }
 
       - name: Publish immutable GitHub Release assets
         shell: pwsh
         env:
-          RELEASE_VERSION: ${{ steps.versions.outputs.release }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.release }}
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $tag = '${{ inputs.release_tag }}'
           $existing = @(& gh release list --repo xrigpc/xrig-releases --limit 1000 --json tagName --jq '.[].tagName')
           if ($LASTEXITCODE -ne 0) { throw 'Could not query existing GitHub Releases.' }
-          if ($existing -contains '${{ inputs.release_tag }}') { throw "GitHub Release ${{ inputs.release_tag }} already exists. Immutable release assets must not be replaced." }
+          if ($existing -contains $tag) { throw "GitHub Release $tag already exists. Immutable release assets must not be replaced." }
           $manifestHash = (Get-FileHash -LiteralPath artifacts\xrig-release-v1.manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          $download = "https://github.com/xrigpc/xrig-releases/releases/download/$tag"
+          $install = if ($env:RELEASE_CHANNEL -eq 'candidate') {
+            @"
+          Install this candidate (it is never served as latest):
+          - Windows: ``& ([scriptblock]::Create((irm $download/Install-Vertex.ps1))) -ReleaseTag $tag``
+          - Ubuntu: ``curl -fsSL $download/install-vertex-linux.sh | XRIG_VERTEX_RELEASE_ROOT=$download bash``
+          "@
+          } else {
+            @"
+          Install:
+          - Windows: ``irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Vertex.ps1 | iex``
+          - Ubuntu: ``curl -fsSL https://github.com/xrigpc/xrig-releases/releases/latest/download/install-vertex-linux.sh | bash``
+          "@
+          }
           @"
           # XRIG Vertex $env:RELEASE_VERSION
 
@@ -308,16 +407,29 @@ jobs:
           - Vertex: ${{ inputs.vertex_tag }} ($env:VERTEX_SHA)
           - Kai compatibility metadata: ${{ inputs.kai_compatibility_tag }}
 
+          Channel: $env:RELEASE_CHANNEL
           Manifest SHA-256: $manifestHash
 
-          This release contains only Vertex and its locked runtime dependencies.
-          Every payload is verified locally with XRIG Platform before use.
-          "@ | Set-Content -LiteralPath artifacts\RELEASE_NOTES.md -Encoding utf8
-          $args = @('release', 'create', '${{ inputs.release_tag }}', '--repo', 'xrigpc/xrig-releases', '--title', "XRIG Vertex $env:RELEASE_VERSION", '--notes-file', 'artifacts\RELEASE_NOTES.md')
-          if ('${{ inputs.prerelease }}' -eq 'true') { $args += '--prerelease' }
-          $args += @(Get-ChildItem artifacts -File | Where-Object { $_.Name -ne 'RELEASE_NOTES.md' } | ForEach-Object FullName)
-          & gh @args
-          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed.' }
+          $install
+
+          This release contains only the Vertex application for Windows and Ubuntu. Runtime stacks
+          and models are versioned and signed separately. XRIG Platform verifies every payload
+          locally before use.
+          "@ | Set-Content -LiteralPath "$env:RUNNER_TEMP\RELEASE_NOTES.md" -Encoding utf8
+          # Upload into a draft so no partial release is ever public, prove the
+          # inventory, then publish.
+          $ghArgs = @('release', 'create', $tag, '--repo', 'xrigpc/xrig-releases', '--target', $env:GITHUB_SHA, '--draft', '--title', "XRIG Vertex $env:RELEASE_VERSION", '--notes-file', "$env:RUNNER_TEMP\RELEASE_NOTES.md")
+          if ($env:RELEASE_CHANNEL -eq 'candidate') { $ghArgs += '--prerelease' }
+          $ghArgs += @(Get-ChildItem artifacts -File | ForEach-Object FullName)
+          & gh @ghArgs
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub draft release creation failed.' }
+          $expected = @(Get-ChildItem artifacts -File | ForEach-Object { [pscustomobject]@{ name = $_.Name; size = [int64]$_.Length } } | Sort-Object name)
+          $actual = @((gh release view $tag --repo xrigpc/xrig-releases --json assets --jq '.assets[] | {name: .name, size: .size}' | ConvertFrom-Json) | Sort-Object name)
+          if (($expected | ConvertTo-Json -Compress) -ne ($actual | ConvertTo-Json -Compress)) { throw 'Draft GitHub Release assets do not match the signed inventory; the draft was left unpublished.' }
+          $publishArgs = @('release', 'edit', $tag, '--repo', 'xrigpc/xrig-releases', '--draft=false')
+          if ($env:RELEASE_CHANNEL -eq 'stable') { $publishArgs += '--latest' }
+          & gh @publishArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the verified draft release failed.' }
 
       - name: Verify published asset inventory
         shell: pwsh
@@ -325,6 +437,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $expected = @(Get-ChildItem artifacts -File | Where-Object { $_.Name -ne 'RELEASE_NOTES.md' } | ForEach-Object { [pscustomobject]@{ name = $_.Name; size = [int64]$_.Length } } | Sort-Object name)
-          $actual = @((gh release view '${{ inputs.release_tag }}' --repo xrigpc/xrig-releases --json assets --jq '.assets[] | {name: .name, size: .size}' | ConvertFrom-Json) | Sort-Object name)
+          $release = gh release view '${{ inputs.release_tag }}' --repo xrigpc/xrig-releases --json isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.isDraft) { throw 'The release is still a draft.' }
+          if ($release.isPrerelease -ne ($env:RELEASE_CHANNEL -eq 'candidate')) { throw 'The release pre-release flag does not match its signed channel.' }
+          $expected = @(Get-ChildItem artifacts -File | ForEach-Object { [pscustomobject]@{ name = $_.Name; size = [int64]$_.Length } } | Sort-Object name)
+          $actual = @($release.assets | ForEach-Object { [pscustomobject]@{ name = $_.name; size = [int64]$_.size } } | Sort-Object name)
+          if ($actual.Count -ne 16) { throw "Expected 16 published Vertex assets, found $($actual.Count)." }
           if (($expected | ConvertTo-Json -Compress) -ne ($actual | ConvertTo-Json -Compress)) { throw 'Published GitHub Release assets do not match the signed inventory.' }

@@ -15,39 +15,41 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Vertex's app-only release contract (xrig-llama-backend
+# scripts/sign-release-manifest.sh): one release version, and every payload is
+# a Vertex binary of that version. Runtime stacks and models are versioned and
+# signed independently, so no llama.cpp or CUDA archive ships here.
+if ($ReleaseTag -ne "v$VertexVersion") { throw 'ReleaseTag must be v<VertexVersion> for the single-product Vertex channel.' }
+
 $assetRoot = (Resolve-Path -LiteralPath $AssetDirectory).Path
 
-function Get-XrigAssetMetadata([string]$Id, [string]$FileName, [string]$Version, [string]$Verification) {
+function Get-XrigAssetMetadata([string]$Id, [string]$FileName) {
     $path = Join-Path $assetRoot $FileName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required Vertex release asset is missing: $FileName" }
-    $metadata = [ordered]@{
+    if (-not (Test-Path -LiteralPath "$path.sig" -PathType Leaf)) { throw "Required Vertex release signature is missing: $FileName.sig" }
+    return [ordered]@{
         id = $Id
         path = $FileName
         sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        sig_path = "$FileName.sig"
         size_bytes = [string](Get-Item -LiteralPath $path).Length
-        verification = $Verification
-        version = $Version
+        verification = 'detached-ed25519'
+        version = $VertexVersion
     }
-    if ($Verification -eq 'detached-ed25519') {
-        $signature = "$path.sig"
-        if (-not (Test-Path -LiteralPath $signature -PathType Leaf)) { throw "Required Vertex release signature is missing: $FileName.sig" }
-        $metadata.sig_path = "$FileName.sig"
-    }
-    return $metadata
 }
 
 $assets = @(
-    (Get-XrigAssetMetadata 'windows.amd64.app' "Vertex-$VertexVersion-win-x64.exe" $VertexVersion 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.cudart' 'cudart-llama-bin-win-cuda-12.4-x64.zip' 'b9878' 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.factory_config' 'gemma4-12b-5060ti.json' $VertexVersion 'manifest'),
-    (Get-XrigAssetMetadata 'windows.amd64.install' "Vertex-install-$VertexVersion-win-x64.exe" $VertexVersion 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.llama_cuda' 'llama-b9878-bin-win-cuda-12.4-x64.zip' 'b9878' 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.llama_openvino' 'llama-b9999-bin-win-openvino-2026.2.1-x64.zip' 'b9999' 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.llama_vulkan' 'llama-b9999-bin-win-vulkan-x64.zip' 'b9999' 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.package' "Vertex-runtime-$VertexVersion-win-x64.tar.gz" $VertexVersion 'detached-ed25519'),
-    (Get-XrigAssetMetadata 'windows.amd64.vertex_installer' "Install-Vertex-inner-$VertexVersion.ps1" $VertexVersion 'detached-ed25519')
+    (Get-XrigAssetMetadata 'linux.amd64.deb' "xrig-vertex_$($VertexVersion)_amd64.deb"),
+    (Get-XrigAssetMetadata 'windows.amd64.vertex_app' 'xrig-app-windows-amd64.exe'),
+    (Get-XrigAssetMetadata 'windows.amd64.vertex_configure' 'vertex-configure-windows-amd64.exe'),
+    (Get-XrigAssetMetadata 'windows.amd64.vertex_installer' "Install-Vertex-$VertexVersion.ps1"),
+    (Get-XrigAssetMetadata 'windows.amd64.vertex_runtime' 'xrig-runtime-windows-amd64.exe'),
+    (Get-XrigAssetMetadata 'windows.amd64.vertex_stack_helper' 'xrig-stack-helper-windows-amd64.exe')
 )
 
+# XRIG Platform's release parser still requires these historical headers. They
+# are compatibility metadata only; the signed stack descriptors own every real
+# runtime and dependency pin.
 $values = @{
     architecture = 'amd64'
     base_url = "https://github.com/xrigpc/xrig-releases/releases/download/$ReleaseTag"
@@ -55,24 +57,19 @@ $values = @{
     cuda_runtime_version = '12.4'
     electron_version = '40.10.2'
     format = 'xrig-release-v1'
-    gpu_profile = 'windows-nvidia-rtx-5060-ti-16gb-cuda'
+    gpu_profile = 'cross-platform-vertex'
     kai_version = $KaiCompatibilityVersion
     llama_cpp_version = 'b9878'
     nvidia_driver_min = '551.61'
     platform_version = $PlatformVersion
-    python_version = '3.12.10'
-    version = $ReleaseTag.Substring(1)
+    python_version = '3.11.9'
+    version = $VertexVersion
     vertex_version = $VertexVersion
     windows_min_build = '22621'
 }
 foreach ($asset in $assets) {
     $prefix = "asset.$($asset.id)"
-    $values["$prefix.path"] = $asset.path
-    $values["$prefix.sha256"] = $asset.sha256
-    if ($asset.verification -eq 'detached-ed25519') { $values["$prefix.sig_path"] = $asset.sig_path }
-    $values["$prefix.size_bytes"] = $asset.size_bytes
-    $values["$prefix.verification"] = $asset.verification
-    $values["$prefix.version"] = $asset.version
+    foreach ($field in @('path', 'sha256', 'sig_path', 'size_bytes', 'verification', 'version')) { $values["$prefix.$field"] = $asset[$field] }
 }
 
 $keys = [string[]]@($values.Keys)

@@ -11,12 +11,18 @@ authority; GitHub's `latest` route is only a download selector.
 
 ## What is published
 
-- `Install-Kai.ps1` and `Install-Vertex.ps1` public bootstraps;
-- the signed `xrig-identity.exe` verifier, Kai and Vertex Windows binaries, and
-  their verified inner installers;
-- locked llama.cpp/CUDA runtime archives;
-- the factory model configuration (model bytes download directly from the
-  pinned public Hugging Face entries in that configuration);
+- `Install-Kai.ps1`, `Install-Vertex.ps1` and `install-vertex-linux.sh` public
+  bootstraps;
+- the signed `xrig-identity.exe` verifier, Kai's Windows binaries and its
+  verified inner installer, locked llama.cpp/CUDA runtime archives, and the
+  factory model configuration (model bytes download directly from the pinned
+  public Hugging Face entries in that configuration);
+- the Vertex application only: its Windows binaries (`xrig-app`,
+  `xrig-runtime`, `xrig-stack-helper`, `vertex-configure`), its inner Windows
+  installer `Install-Vertex-<version>.ps1`, and its Ubuntu package
+  `xrig-vertex_<version>_amd64.deb`. Vertex runtime stacks (llama.cpp, Strata)
+  and model configurations are signed and versioned independently and are not
+  part of a Vertex release;
 - an Ed25519 signature for every release payload and the canonical manifest.
 
 The release copy of `xrig-identity.exe` is a signed verifier/repair artifact;
@@ -34,11 +40,19 @@ Run the appropriate workflow manually from this repository. Each requires exact
 - `xrigpc/kai` for `publish-release.yml`
 - `xrigpc/xrig-llama-backend` for `publish-vertex-release.yml`
 
-The Kai workflow compiles Kai only; the Vertex workflow compiles Vertex and its
-locked runtime archives only. Both validate the signed manifest with the
-Platform verifier and create either a GitHub pre-release or stable release. The
+The Kai workflow compiles Kai only. The Vertex workflow builds the Ubuntu
+package on Ubuntu 24.04 (the package's glibc baseline), then builds Windows,
+signs everything and publishes from one protected Windows job, so a Vertex
+release needs two `production` approvals. Both workflows validate the signed
+manifest, and the Vertex workflow also verifies every signed asset, with the
+Platform verifier. Assets are uploaded to a draft that becomes a GitHub
+pre-release or stable release only after its inventory matches. The
 cross-product version field is compatibility metadata, not a rebuilt payload. A
 versioned asset is never replaced with different bytes.
+
+The manifest signs its channel: a `-rc.N` tag is always `candidate` and a plain
+tag is always `stable`. A candidate is therefore never promoted by editing the
+GitHub release; publish the stable version with its own tag and run.
 
 ## Required protected-environment configuration
 
@@ -69,16 +83,33 @@ Invoke-WebRequest "https://github.com/xrigpc/xrig-releases/releases/download/$ta
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-Kai.ps1
 ```
 
+For a Vertex candidate:
+
+```powershell
+$tag = 'v1.1.0-rc.1'
+& ([scriptblock]::Create((irm "https://github.com/xrigpc/xrig-releases/releases/download/$tag/Install-Vertex.ps1"))) -ReleaseTag $tag
+```
+
+```bash
+tag=v1.1.0-rc.1
+curl -fsSL "https://github.com/xrigpc/xrig-releases/releases/download/$tag/install-vertex-linux.sh" |
+  XRIG_VERTEX_RELEASE_ROOT="https://github.com/xrigpc/xrig-releases/releases/download/$tag" bash
+```
+
 This is only for factory and clean-runner pre-release validation; owner
 installation always uses the stable URL below.
 
 ## Public stable URLs
 
-Once a pre-release is promoted to stable, the public installation endpoints are:
+Once a stable release is published, the public installation endpoints are:
 
 ```powershell
 irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Kai.ps1 | iex
 irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Vertex.ps1 | iex
+```
+
+```bash
+curl -fsSL https://github.com/xrigpc/xrig-releases/releases/latest/download/install-vertex-linux.sh | bash
 ```
 
 The initial bootstrap is HTTPS-trusted by design. Before elevation or product
