@@ -11,18 +11,16 @@ authority; GitHub's `latest` route is only a download selector.
 
 ## What is published
 
-- `Install-Kai.ps1`, `Install-Vertex.ps1` and `install-vertex-linux.sh` public
-  bootstraps;
+- `Install-Kai.ps1` and `install-vertex-linux.sh` public bootstraps;
 - the signed `xrig-identity.exe` verifier, Kai's Windows binaries and its
   verified inner installer, locked llama.cpp/CUDA runtime archives, and the
   factory model configuration (model bytes download directly from the pinned
   public Hugging Face entries in that configuration);
-- the Vertex application only: its Windows binaries (`xrig-app`,
-  `xrig-runtime`, `xrig-stack-helper`, `vertex-configure`), its inner Windows
-  installer `Install-Vertex-<version>.ps1`, and its Ubuntu package
-  `xrig-vertex_<version>_amd64.deb`. Vertex runtime stacks (llama.cpp, Strata)
-  and model configurations are signed and versioned independently and are not
-  part of a Vertex release;
+- the Vertex application only, for Linux: its Ubuntu package
+  `xrig-vertex_<version>_amd64.deb`. Vertex no longer ships for Windows (the
+  Windows sources remain in Vertex but are not built or published). Vertex
+  runtime stacks (llama.cpp, Strata) and model configurations are signed and
+  versioned independently and are not part of a Vertex release;
 - an Ed25519 signature for every release payload and the canonical manifest.
 
 The release copy of `xrig-identity.exe` is a signed verifier/repair artifact;
@@ -40,10 +38,11 @@ Run the appropriate workflow manually from this repository. Each requires exact
 - `xrigpc/kai` for `publish-release.yml`
 - `xrigpc/xrig-llama-backend` for `publish-vertex-release.yml`
 
-The Kai workflow compiles Kai only. The Vertex workflow builds the Ubuntu
-package on Ubuntu 24.04 (the package's glibc baseline), then builds Windows,
-signs everything and publishes from one protected Windows job, so a Vertex
-release needs two `production` approvals. Both workflows validate the signed
+The Kai workflow compiles Kai only. The Vertex workflow tests, builds, signs
+and publishes the Ubuntu package from one protected Ubuntu 24.04 job (the
+package's glibc baseline), so a Vertex release needs one `production` approval.
+A Vertex release has five assets: `install-vertex-linux.sh`, the `.deb` and
+its signature, and the manifest and its signature. Both workflows validate the signed
 manifest, and the Vertex workflow also verifies every signed asset, with the
 Platform verifier. Assets are uploaded to a draft that becomes a GitHub
 pre-release or stable release only after its inventory matches. The
@@ -85,13 +84,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-Kai.ps1
 
 For a Vertex candidate:
 
-```powershell
-$tag = 'v1.1.0-rc.1'
-& ([scriptblock]::Create((irm "https://github.com/xrigpc/xrig-releases/releases/download/$tag/Install-Vertex.ps1"))) -ReleaseTag $tag
-```
-
 ```bash
-tag=v1.1.0-rc.1
+tag=v1.1.0-rc.2
 curl -fsSL "https://github.com/xrigpc/xrig-releases/releases/download/$tag/install-vertex-linux.sh" |
   XRIG_VERTEX_RELEASE_ROOT="https://github.com/xrigpc/xrig-releases/releases/download/$tag" bash
 ```
@@ -105,7 +99,6 @@ Once a stable release is published, the public installation endpoints are:
 
 ```powershell
 irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Kai.ps1 | iex
-irm https://github.com/xrigpc/xrig-releases/releases/latest/download/Install-Vertex.ps1 | iex
 ```
 
 ```bash
