@@ -15,10 +15,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Vertex's app-only release contract (xrig-llama-backend
-# scripts/sign-release-manifest.sh): one release version, and every payload is
-# a Vertex binary of that version. Runtime stacks and models are versioned and
-# signed independently, so no llama.cpp or CUDA archive ships here.
+# Vertex's app-only, Linux-only release contract: one release version, and the
+# single signed payload is the Vertex Ubuntu package of that version. Runtime
+# stacks and models are versioned and signed independently, so no llama.cpp or
+# CUDA archive ships here. Windows is not built or published.
 if ($ReleaseTag -ne "v$VertexVersion") { throw 'ReleaseTag must be v<VertexVersion> for the single-product Vertex channel.' }
 
 $assetRoot = (Resolve-Path -LiteralPath $AssetDirectory).Path
@@ -39,17 +39,12 @@ function Get-XrigAssetMetadata([string]$Id, [string]$FileName) {
 }
 
 $assets = @(
-    (Get-XrigAssetMetadata 'linux.amd64.deb' "xrig-vertex_$($VertexVersion)_amd64.deb"),
-    (Get-XrigAssetMetadata 'windows.amd64.vertex_app' 'xrig-app-windows-amd64.exe'),
-    (Get-XrigAssetMetadata 'windows.amd64.vertex_configure' 'vertex-configure-windows-amd64.exe'),
-    (Get-XrigAssetMetadata 'windows.amd64.vertex_installer' "Install-Vertex-$VertexVersion.ps1"),
-    (Get-XrigAssetMetadata 'windows.amd64.vertex_runtime' 'xrig-runtime-windows-amd64.exe'),
-    (Get-XrigAssetMetadata 'windows.amd64.vertex_stack_helper' 'xrig-stack-helper-windows-amd64.exe')
+    (Get-XrigAssetMetadata 'linux.amd64.deb' "xrig-vertex_$($VertexVersion)_amd64.deb")
 )
 
-# XRIG Platform's release parser still requires these historical headers. They
-# are compatibility metadata only; the signed stack descriptors own every real
-# runtime and dependency pin.
+# XRIG Platform's release parser still requires these historical headers,
+# including windows_min_build. They are compatibility metadata only; the signed
+# stack descriptors own every real runtime and dependency pin.
 $values = @{
     architecture = 'amd64'
     base_url = "https://github.com/xrigpc/xrig-releases/releases/download/$ReleaseTag"

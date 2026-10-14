@@ -4,15 +4,13 @@ $ErrorActionPreference = 'Stop'
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("xrig-vertex-manifest-test-" + [Guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $temporary | Out-Null
 try {
-    $signed = @(
-        'xrig-vertex_1.1.0-rc.1_amd64.deb',
-        'xrig-app-windows-amd64.exe',
-        'xrig-runtime-windows-amd64.exe',
-        'xrig-stack-helper-windows-amd64.exe',
-        'vertex-configure-windows-amd64.exe',
-        'Install-Vertex-1.1.0-rc.1.ps1'
-    )
+    $signed = @('xrig-vertex_1.1.0-rc.1_amd64.deb')
     foreach ($name in $signed) {
+        [IO.File]::WriteAllBytes((Join-Path $temporary $name), [byte[]](0x4d, 0x5a, 0x90, 0x00))
+        [IO.File]::WriteAllText((Join-Path $temporary "$name.sig"), 'test-signature', [Text.UTF8Encoding]::new($false))
+    }
+    # Stray Windows payloads are never listed, even when present.
+    foreach ($name in @('xrig-app-windows-amd64.exe', 'Install-Vertex-1.1.0-rc.1.ps1')) {
         [IO.File]::WriteAllBytes((Join-Path $temporary $name), [byte[]](0x4d, 0x5a, 0x90, 0x00))
         [IO.File]::WriteAllText((Join-Path $temporary "$name.sig"), 'test-signature', [Text.UTF8Encoding]::new($false))
     }
@@ -28,9 +26,8 @@ try {
     $headers = @($keys | Where-Object { -not $_.StartsWith('asset.') })
     if ($headers.Count -ne 15) { throw "Manifest must carry exactly the 15 Platform headers, found $($headers.Count)." }
     $assetIds = @($keys | Where-Object { $_.StartsWith('asset.') } | ForEach-Object { $_ -replace '^asset\.(.+)\.[a-z0-9_]+$', '$1' } | Sort-Object -Unique)
-    $expectedIds = @('linux.amd64.deb', 'windows.amd64.vertex_app', 'windows.amd64.vertex_configure', 'windows.amd64.vertex_installer', 'windows.amd64.vertex_runtime', 'windows.amd64.vertex_stack_helper')
-    if (($assetIds -join ',') -ne ($expectedIds -join ',')) { throw "Unexpected manifest asset ids: $($assetIds -join ', ')" }
-    if (@($keys | Where-Object { $_.StartsWith('asset.') }).Count -ne 36) { throw 'Every asset must carry path, sha256, sig_path, size_bytes, verification and version.' }
+    if (($assetIds -join ',') -ne 'linux.amd64.deb') { throw "Unexpected manifest asset ids: $($assetIds -join ', ')" }
+    if (@($keys | Where-Object { $_.StartsWith('asset.') }).Count -ne 6) { throw 'The package must carry path, sha256, sig_path, size_bytes, verification and version.' }
     foreach ($line in @(
         'base_url=https://github.com/xrigpc/xrig-releases/releases/download/v1.1.0-rc.1',
         'channel=candidate',
@@ -42,16 +39,16 @@ try {
         'kai_version=1.0.2-rc.1',
         'asset.linux.amd64.deb.path=xrig-vertex_1.1.0-rc.1_amd64.deb',
         'asset.linux.amd64.deb.sig_path=xrig-vertex_1.1.0-rc.1_amd64.deb.sig',
-        'asset.windows.amd64.vertex_installer.path=Install-Vertex-1.1.0-rc.1.ps1',
-        'asset.windows.amd64.vertex_app.sha256=9f2981a7cc4d40a2a409dc895de64253acd819d7c0011c8e80b86fe899464e31',
-        'asset.windows.amd64.vertex_app.size_bytes=4',
-        'asset.windows.amd64.vertex_stack_helper.verification=detached-ed25519',
-        'asset.windows.amd64.vertex_configure.version=1.1.0-rc.1'
+        'asset.linux.amd64.deb.sha256=9f2981a7cc4d40a2a409dc895de64253acd819d7c0011c8e80b86fe899464e31',
+        'asset.linux.amd64.deb.size_bytes=4',
+        'asset.linux.amd64.deb.verification=detached-ed25519',
+        'asset.linux.amd64.deb.version=1.1.0-rc.1',
+        'windows_min_build=22621'
     )) {
         if ($content -notmatch "(?m)^$([Regex]::Escape($line))$") { throw "Missing manifest line: $line" }
     }
     if ($content -match '(?m)^asset\.[^=]*\.verification=(?!detached-ed25519$)') { throw 'Every Vertex asset must be detached-ed25519 signed.' }
-    if ($content -match 'asset\.windows\.amd64\.(kai|identity|llama|cudart|factory_config|app\.|install\.|package)') { throw 'Vertex-only manifest must not carry Kai, Platform, runtime archive or legacy payloads.' }
+    if ($content -match '(?m)^asset\.windows\.') { throw 'The Linux-only Vertex manifest must not carry Windows payloads.' }
 
     $rejected = $false
     try {
@@ -70,4 +67,4 @@ try {
 }
 finally { Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue }
 
-Write-Host 'Vertex-only release manifest contract passed.'
+Write-Host 'Linux-only Vertex release manifest contract passed.'
