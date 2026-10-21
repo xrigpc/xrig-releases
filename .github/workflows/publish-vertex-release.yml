@@ -157,7 +157,8 @@ jobs:
         with:
           node-version-file: src/vertex/.node-version
           cache: npm
-          cache-dependency-path: src/vertex/cmd/xrig-app/frontend/package-lock.json
+          # Vertex 1.1.0-rc.7 renamed cmd/xrig-app to cmd/vertex-app.
+          cache-dependency-path: src/vertex/cmd/*-app/frontend/package-lock.json
 
       - name: Ubuntu baseline native GUI dependencies
         run: |
@@ -206,11 +207,15 @@ jobs:
           [[ -z "$unformatted" ]] || { echo "gofmt required on: $unformatted" >&2; exit 1; }
           go vet ./...
           go test ./...
-          npm ci --prefix cmd/xrig-app/frontend
-          npm test --prefix cmd/xrig-app/frontend -- --run
+          # Vertex 1.1.0-rc.7 renamed cmd/xrig-app to cmd/vertex-app; earlier
+          # tags keep building from the old directory.
+          app_dir=cmd/vertex-app
+          [[ -d "$app_dir" ]] || app_dir=cmd/xrig-app
+          npm ci --prefix "$app_dir/frontend"
+          npm test --prefix "$app_dir/frontend" -- --run
           bash scripts/build-linux-gui.sh
           # The GUI embeds frontend/dist, which the build above produced.
-          go test -tags xrigapp,webkit2_41 ./cmd/xrig-app -count=1
+          go test -tags xrigapp,webkit2_41 "./$app_dir" -count=1
           bash scripts/build-linux-deb.sh "$VERTEX_VERSION"
           deb="dist/xrig-vertex_${VERTEX_VERSION}_amd64.deb"
           [[ "$(dpkg-deb --field "$deb" Package)" == xrig-vertex ]] || { echo 'unexpected package name' >&2; exit 1; }
